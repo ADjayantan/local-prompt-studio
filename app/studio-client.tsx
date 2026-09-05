@@ -138,6 +138,7 @@ export default function StudioClient() {
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [serverError, setServerError] = useState('');
   const [connecting, setConnecting] = useState(false);
+  const [remoteConnectionRequested, setRemoteConnectionRequested] = useState(false);
   const [apiBase, setApiBase] = useState(DEFAULT_API);
   const [apiDraft, setApiDraft] = useState(DEFAULT_API);
   const active = useMemo(() => modes.find((item) => item.id === mode)!, [mode]);
@@ -168,10 +169,14 @@ export default function StudioClient() {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    // Chrome requires a user gesture before a public HTTPS page can request
+    // loopback-network permission. The Connect button below provides it.
+    const hosted = window.location.hostname.endsWith('github.io');
+    if (hosted && !remoteConnectionRequested) return;
+    if (!hosted) void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 5000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, remoteConnectionRequested]);
 
   useEffect(() => {
     if (!job || !['queued', 'running'].includes(job.status)) return;
@@ -359,7 +364,7 @@ export default function StudioClient() {
                 <input id="api-address" value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs outline-none focus:border-primary/45" />
                 <Button type="button" size="sm" variant="outline" onClick={saveApiAddress}>Save</Button>
               </div>
-              <Button type="button" size="sm" onClick={() => void refresh()} disabled={connecting} className="mt-3 w-full bg-primary text-primary-foreground hover:bg-primary/80">
+              <Button type="button" size="sm" onClick={() => { setRemoteConnectionRequested(true); void refresh(); }} disabled={connecting} className="mt-3 w-full bg-primary text-primary-foreground hover:bg-primary/80">
                 {connecting ? <LoaderCircle className="animate-spin" /> : <Wifi />} {connecting ? 'Connecting…' : 'Connect to laptop'}
               </Button>
               {!system && <p className="mt-2 text-xs leading-5 text-amber-200/80">On the GitHub site, Chrome may ask to connect with an app on this laptop. Choose <strong>Allow</strong> once.</p>}
