@@ -31,12 +31,18 @@ jobs:
         run: npm run build:pages
         env:
           GITHUB_PAGES: 'true'
+      - name: Prepare GitHub Pages artifact
+        run: |
+          mkdir -p pages-dist
+          cp dist/client/index.html dist/client/index.rsc dist/client/favicon.svg pages-dist/
+          cp pages-dist/index.html pages-dist/404.html
+          cp -R "dist/client/${{ github.event.repository.name }}/_next" pages-dist/_next
       - uses: actions/configure-pages@v5
         with:
           enablement: true
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: dist/client
+          path: pages-dist
       - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4
