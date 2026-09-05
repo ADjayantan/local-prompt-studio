@@ -155,6 +155,7 @@ export default function StudioClient() {
       setJobs(nextJobs);
       setServerError('');
     } catch {
+      setSystem(null);
       setServerError('Cannot reach the local backend yet. Click “Connect to laptop” and allow the browser permission prompt. If the local engine is off, run start-local-studio.ps1.');
     } finally {
       setConnecting(false);
@@ -364,8 +365,8 @@ export default function StudioClient() {
                 <input id="api-address" value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs outline-none focus:border-primary/45" />
                 <Button type="button" size="sm" variant="outline" onClick={saveApiAddress}>Save</Button>
               </div>
-              <Button type="button" size="sm" onClick={() => { setRemoteConnectionRequested(true); void refresh(); }} disabled={connecting} className="mt-3 w-full bg-primary text-primary-foreground hover:bg-primary/80">
-                {connecting ? <LoaderCircle className="animate-spin" /> : <Wifi />} {connecting ? 'Connecting…' : 'Connect to laptop'}
+              <Button type="button" size="sm" onClick={() => { setRemoteConnectionRequested(true); void refresh(); }} disabled={connecting} className={`mt-3 w-full ${system ? 'bg-emerald-500 text-white hover:bg-emerald-500' : 'bg-primary text-primary-foreground hover:bg-primary/80'}`}>
+                {connecting ? <LoaderCircle className="animate-spin" /> : system ? <Check /> : <Wifi />} {connecting ? 'Connecting…' : system ? 'Laptop connected' : 'Connect to laptop'}
               </Button>
               {!system && <p className="mt-2 text-xs leading-5 text-amber-200/80">On the GitHub site, Chrome may ask to connect with an app on this laptop. Choose <strong>Allow</strong> once.</p>}
               <p className="mt-2 text-xs leading-5 text-muted-foreground">Saved in this browser. Normally you never need to change it.</p>
