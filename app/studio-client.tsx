@@ -154,6 +154,9 @@ export default function StudioClient() {
       setSystem(nextSystem);
       setJobs(nextJobs);
       setServerError('');
+      if (window.location.hostname.endsWith('github.io')) {
+        window.localStorage.setItem('prompt-studio-local-access', 'connected');
+      }
     } catch {
       setSystem(null);
       setServerError('Cannot reach the local backend yet. Click “Connect to laptop” and allow the browser permission prompt. If the local engine is off, run start-local-studio.ps1.');
@@ -173,8 +176,9 @@ export default function StudioClient() {
     // Chrome requires a user gesture before a public HTTPS page can request
     // loopback-network permission. The Connect button below provides it.
     const hosted = window.location.hostname.endsWith('github.io');
-    if (hosted && !remoteConnectionRequested) return;
-    if (!hosted) void refresh();
+    const remembered = window.localStorage.getItem('prompt-studio-local-access') === 'connected';
+    if (hosted && !remoteConnectionRequested && !remembered) return;
+    if (!hosted || remembered) void refresh();
     const timer = window.setInterval(() => { void refresh(); }, 5000);
     return () => window.clearInterval(timer);
   }, [refresh, remoteConnectionRequested]);
