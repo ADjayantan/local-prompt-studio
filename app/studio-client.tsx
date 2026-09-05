@@ -19,6 +19,7 @@ import {
   Sparkles,
   Volume2,
   WandSparkles,
+  Wifi,
   WifiOff,
   Zap,
 } from 'lucide-react';
@@ -57,12 +58,19 @@ type WebMcpContext = {
   registerTool: (tool: Record<string, unknown>, options?: { signal?: AbortSignal }) => void | Promise<void>;
 };
 
-const DEFAULT_API = 'http://127.0.0.1:8765';
+const DEFAULT_API = 'http://localhost:8765';
 
 type LocalRequestInit = RequestInit & { targetAddressSpace?: 'loopback' };
 
 function localFetch(input: RequestInfo | URL, init: LocalRequestInit = {}) {
-  return fetch(input, { ...init, targetAddressSpace: 'loopback' } as RequestInit);
+  // A public HTTPS page needs to declare that this request deliberately targets
+  // the local machine. Chrome then presents its Local Network Access prompt.
+  const request = new Request(input, {
+    ...init,
+    mode: 'cors',
+    targetAddressSpace: 'loopback',
+  } as RequestInit);
+  return fetch(request);
 }
 
 const modes = [
@@ -129,12 +137,14 @@ export default function StudioClient() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [serverError, setServerError] = useState('');
+  const [connecting, setConnecting] = useState(false);
   const [apiBase, setApiBase] = useState(DEFAULT_API);
   const [apiDraft, setApiDraft] = useState(DEFAULT_API);
   const active = useMemo(() => modes.find((item) => item.id === mode)!, [mode]);
   const busy = job?.status === 'queued' || job?.status === 'running';
 
   const refresh = useCallback(async () => {
+    setConnecting(true);
     try {
       const [nextSystem, nextJobs] = await Promise.all([
         localFetch(`${apiBase}/api/status`).then((response) => readJson<SystemStatus>(response)),
@@ -144,7 +154,9 @@ export default function StudioClient() {
       setJobs(nextJobs);
       setServerError('');
     } catch {
-      setServerError('Local backend is not running. Use start-local-studio.ps1.');
+      setServerError('Cannot reach the local backend yet. Click “Connect to laptop” and allow the browser permission prompt. If the local engine is off, run start-local-studio.ps1.');
+    } finally {
+      setConnecting(false);
     }
   }, [apiBase]);
 
@@ -347,6 +359,10 @@ export default function StudioClient() {
                 <input id="api-address" value={apiDraft} onChange={(event) => setApiDraft(event.target.value)} className="min-w-0 flex-1 rounded-lg border border-white/10 bg-black/20 px-3 py-2 text-xs outline-none focus:border-primary/45" />
                 <Button type="button" size="sm" variant="outline" onClick={saveApiAddress}>Save</Button>
               </div>
+              <Button type="button" size="sm" onClick={() => void refresh()} disabled={connecting} className="mt-3 w-full bg-primary text-primary-foreground hover:bg-primary/80">
+                {connecting ? <LoaderCircle className="animate-spin" /> : <Wifi />} {connecting ? 'Connecting…' : 'Connect to laptop'}
+              </Button>
+              {!system && <p className="mt-2 text-xs leading-5 text-amber-200/80">On the GitHub site, Chrome may ask to connect with an app on this laptop. Choose <strong>Allow</strong> once.</p>}
               <p className="mt-2 text-xs leading-5 text-muted-foreground">Saved in this browser. Normally you never need to change it.</p>
             </div>
           </div>
