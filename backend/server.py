@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import subprocess
+import threading
+import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+from generators import OUTPUT_ROOT, capability_status, generate
+
+
+HOST = "127.0.0.1"
+CONFIG_FILE = Path(__file__).with_name("config.json")
+JOBS_FILE = OUTPUT_ROOT / "jobs.json"
+MAX_JOBS = 50
+jobs: dict[str, dict] = {}
+jobs_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prompt-studio")
+
+
+def allowed_origins() -> set[str]:
+    origins = {"http://localhost:3000", "http://127.0.0.1:3000"}
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        origins.update(str(value).rstrip("/") for value in config.get("allowedOrigins", []) if value)
+    except (OSError, ValueError, TypeError):
+        pass
+    origins.update(value.strip().rstrip("/") for value in os.environ.get("PROMPT_STUDIO_ALLOWED_ORIGINS", "").split(",") if value.strip())
+    return origins
+
+
+ALLOWED_ORIGINS = allowed_origins()
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def public_job(job: dict) -> dict:
+    result = dict(job)
+    if result.get("outputPath"):
+        result["fileUrl"] = f"http://{HOST}:{PORT}/api/files/{result['id']}"
+    if result.get("previewPath"):
+        result["previewUrl"] = f"http://{HOST}:{PORT}/api/previews/{result['id']}"
+    return result
+
+
+def persist() -> None:
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    with jobs_lock:
+        snapshot = list(jobs.values())[-MAX_JOBS:]
+    temp = JOBS_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    temp.replace(JOBS_FILE)
+
+
+def load_jobs() -> None:
+    if not JOBS_FILE.exists():
+        return
+    try:
+        data = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            for job in data:
+                if isinstance(job, dict) and job.get("id"):
+                    if job.get("status") in {"queued", "running"}:
+                        job["status"] = "error"
+                        job["error"] = "Local server stopped before this job finished"
+                    jobs[str(job["id"])] = job
+    except Exception:
+        pass
+
+
+def update_job(job_id: str, **changes) -> None:
+    with jobs_lock:
+        jobs[job_id].update(changes)
+        jobs[job_id]["updatedAt"] = now()
+    persist()
+
+
+def worker(job_id: str, kind: str, prompt: str) -> None:
+    update_job(job_id, status="running", progress=2, message="Starting local engine")
+
+    def progress(value: int, message: str) -> None:
+        update_job(job_id, progress=max(0, min(100, value)), message=message)
+
+    try:
+        output = generate(kind, job_id, prompt, progress)
+        preview = output.with_suffix(".pdf") if kind == "ppt" else None
+        update_job(
+            job_id,
+            status="complete",
+            progress=100,
+            message="Ready",
+            outputPath=str(output),
+            outputName=output.name,
+            sizeBytes=output.stat().st_size,
+            previewPath=str(preview) if preview and preview.exists() else None,
+        )
+    except Exception as exc:
+        update_job(job_id, status="error", message="Generation failed", error=str(exc))
+        traceback.print_exc()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "LocalPromptStudio/1.0"
+
+    def log_message(self, format: str, *args) -> None:
+        print(f"[{self.log_date_time_string()}] {format % args}")
+
+    def cors(self) -> None:
+        origin = self.headers.get("Origin", "")
+        if origin.rstrip("/") in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin, Access-Control-Request-Private-Network")
+
+    def json_response(self, payload, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self.cors()
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        path = urlparse(self.path).path
+        if path == "/api/health":
+            self.json_response({"ok": True, "service": "Local Prompt Studio", "version": 2})
+            return
+        if path == "/api/status":
+            try:
+                self.json_response(capability_status())
+            except Exception as exc:
+                self.json_response({"error": str(exc)}, 500)
+            return
+        if path == "/api/jobs":
+            with jobs_lock:
+                items = [public_job(item) for item in reversed(list(jobs.values()))]
+            self.json_response(items[:20])
+            return
+        if path.startswith("/api/jobs/"):
+            job_id = unquote(path.removeprefix("/api/jobs/"))
+            with jobs_lock:
+                item = jobs.get(job_id)
+            self.json_response(public_job(item) if item else {"error": "Job not found"}, 200 if item else 404)
+            return
+        if path.startswith("/api/files/"):
+            job_id = unquote(path.removeprefix("/api/files/"))
+            with jobs_lock:
+                item = jobs.get(job_id)
+            if not item or not item.get("outputPath"):
+                self.json_response({"error": "Output not found"}, 404)
+                return
+            file_path = Path(item["outputPath"]).resolve()
+            root = OUTPUT_ROOT.resolve()
+            if root not in file_path.parents or not file_path.is_file():
+                self.json_response({"error": "Output is unavailable"}, 404)
+                return
+            content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+            self.send_response(200)
+            self.cors()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(file_path.stat().st_size))
+            self.send_header("Content-Disposition", f'inline; filename="{file_path.name}"')
+            self.end_headers()
+            with file_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    self.wfile.write(chunk)
+            return
+        if path.startswith("/api/previews/"):
+            job_id = unquote(path.removeprefix("/api/previews/"))
+            with jobs_lock:
+                item = jobs.get(job_id)
+            if not item or not item.get("previewPath"):
+                self.json_response({"error": "Preview not found"}, 404)
+                return
+            file_path = Path(item["previewPath"]).resolve()
+            root = OUTPUT_ROOT.resolve()
+            if root not in file_path.parents or not file_path.is_file():
+                self.json_response({"error": "Preview is unavailable"}, 404)
+                return
+            self.send_response(200)
+            self.cors()
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(file_path.stat().st_size))
+            self.send_header("Content-Disposition", f'inline; filename="{file_path.name}"')
+            self.end_headers()
+            with file_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    self.wfile.write(chunk)
+            return
+        self.json_response({"error": "Not found"}, 404)
+
+    def read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 64 * 1024:
+            raise ValueError("Request is too large")
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON object expected")
+        return payload
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        try:
+            payload = self.read_json()
+        except (ValueError, json.JSONDecodeError) as exc:
+            self.json_response({"error": str(exc)}, 400)
+            return
+        if path == "/api/generate":
+            kind = str(payload.get("type", ""))
+            prompt = str(payload.get("prompt", "")).strip()
+            if kind not in {"image", "audio", "video", "ppt", "markdown"}:
+                self.json_response({"error": "Unsupported creation type"}, 400)
+                return
+            if len(prompt) < 3 or len(prompt) > 4000:
+                self.json_response({"error": "Prompt must be between 3 and 4000 characters"}, 400)
+                return
+            job_id = uuid.uuid4().hex[:10]
+            job = {
+                "id": job_id,
+                "type": kind,
+                "prompt": prompt,
+                "status": "queued",
+                "progress": 0,
+                "message": "Waiting for local engine",
+                "createdAt": now(),
+                "updatedAt": now(),
+            }
+            with jobs_lock:
+                jobs[job_id] = job
+            persist()
+            executor.submit(worker, job_id, kind, prompt)
+            self.json_response(public_job(job), 202)
+            return
+        if path == "/api/open-output":
+            OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(["explorer.exe", str(OUTPUT_ROOT)], creationflags=subprocess.CREATE_NO_WINDOW)
+            self.json_response({"opened": True, "path": str(OUTPUT_ROOT)})
+            return
+        self.json_response({"error": "Not found"}, 404)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Local Prompt Studio backend")
+    parser.add_argument("--port", type=int, default=8765)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    PORT = args.port
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    load_jobs()
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"Local Prompt Studio API: http://{HOST}:{PORT}")
+    print(f"Offline outputs: {OUTPUT_ROOT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
