@@ -87,7 +87,6 @@ def llm_complete(
     user_prompt: str,
     *,
     temperature: float = 0.4,
-    as_json: bool = False,
     num_ctx: int = 4096,
 ) -> str:
     """Single-shot completion from the local Ollama server. Raises if offline."""
@@ -103,8 +102,6 @@ def llm_complete(
         "stream": False,
         "options": {"temperature": temperature, "num_ctx": num_ctx},
     }
-    if as_json:
-        payload["format"] = "json"
     request = urllib.request.Request(
         f"{OLLAMA_HOST}/api/generate",
         data=json.dumps(payload).encode("utf-8"),
@@ -116,18 +113,6 @@ def llm_complete(
     text = str(data.get("response", "")).strip()
     if not text:
         raise RuntimeError("Local LLM returned an empty response")
-    return text
-
-
-def _extract_json(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start : end + 1]
     return text
 
 
@@ -480,49 +465,58 @@ def _ppt_template_slides(topic: str) -> list[tuple[str, str]]:
     ]
 
 
-def _parse_slides_json(raw: str) -> list[tuple[str, str]]:
-    try:
-        data = json.loads(_extract_json(raw))
-    except (ValueError, json.JSONDecodeError):
-        return []
-    items = data.get("slides") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return []
+def _parse_slides_text(raw: str) -> list[tuple[str, str]]:
+    """Parse the small model's plain-text slide format (far more reliable than
+    asking a 3B model for nested JSON, which it frequently mangles)."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw).strip()
     slides: list[tuple[str, str]] = []
-    for item in items:
-        if not isinstance(item, dict):
+    title: str | None = None
+    bullets: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
             continue
-        title = str(item.get("title", "")).strip()
-        raw_bullets = item.get("bullets", item.get("content", []))
-        if isinstance(raw_bullets, str):
-            lines = [line.strip() for line in raw_bullets.splitlines() if line.strip()]
-        elif isinstance(raw_bullets, list):
-            lines = [str(bullet).strip().lstrip("-•*0123456789. ").strip() for bullet in raw_bullets]
-        else:
-            lines = []
-        lines = [line for line in lines if line]
-        if not title and not lines:
+        match = re.match(r"^SLIDE\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if match:
+            if title or bullets:
+                slides.append((title or "Slide", "\n".join(bullets)))
+            title = match.group(1).strip().strip("*").strip()
+            bullets = []
             continue
-        slides.append((title or "Slide", "\n".join(lines)))
+        bullet = re.sub(r"^[-•*]\s*|^\d+[.)]\s*", "", line).strip()
+        if bullet:
+            bullets.append(bullet)
+    if title or bullets:
+        slides.append((title or "Slide", "\n".join(bullets)))
     return slides[:8]
 
 
 def _ppt_llm_slides(topic: str) -> list[tuple[str, str]]:
     system_prompt = (
         "You are a presentation designer. You produce clear, accurate, classroom-ready "
-        "slides and return STRICT JSON only, with no commentary."
+        "slide content in plain text only — never JSON, never markdown."
     )
     user_prompt = (
-        f'Create a slide deck about: "{topic}".\n'
-        'Return JSON exactly of the form: {"slides":[{"title":"...","bullets":["...","..."]}]}\n'
-        "Rules: 5 to 7 slides total. The first slide is a title slide (its bullets hold a "
-        "one-line subtitle). Every other slide has 3 to 5 short bullet points, each under "
-        "about 12 words. Plain text bullets only — no markdown, no numbering."
+        f'Create slide content about: "{topic}".\n'
+        "Respond using EXACTLY this plain-text format and nothing else:\n"
+        "SLIDE: <title>\n"
+        "- <bullet>\n"
+        "SLIDE: <title>\n"
+        "- <bullet>\n"
+        "- <bullet>\n"
+        "Rules: 5 to 7 slides total. The first slide is a title slide with one bullet "
+        "as a subtitle. Every other slide has 3 to 5 short bullets, each under about "
+        "12 words. No numbering, no markdown, no commentary before or after."
     )
-    slides = _parse_slides_json(llm_complete(system_prompt, user_prompt, temperature=0.4, as_json=True))
-    if len(slides) < 3:
-        raise RuntimeError("Local LLM did not return enough usable slides")
-    return slides
+    for _ in range(2):
+        response = llm_complete(system_prompt, user_prompt, temperature=0.4)
+        slides = _parse_slides_text(response)
+        if len(slides) >= 3:
+            return slides
+    raise RuntimeError("Local LLM did not return enough usable slides")
 
 
 def generate_ppt(job_id: str, prompt: str, progress: Progress) -> Path:
