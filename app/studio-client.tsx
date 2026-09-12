@@ -21,6 +21,7 @@ import {
   WandSparkles,
   Wifi,
   WifiOff,
+  Workflow,
   Zap,
 } from 'lucide-react';
 
@@ -29,7 +30,7 @@ import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { Textarea } from '@/components/ui/textarea';
 
-type CreatorMode = 'image' | 'audio' | 'video' | 'ppt' | 'markdown';
+type CreatorMode = 'image' | 'diagram' | 'audio' | 'video' | 'ppt' | 'markdown';
 type JobStatus = 'queued' | 'running' | 'complete' | 'error';
 
 type Job = {
@@ -47,11 +48,13 @@ type Job = {
 };
 
 type Capability = { ready: boolean; engine: string };
+type LlmStatus = { ready: boolean; engine: string; model?: string; host?: string };
 type SystemStatus = {
   offline: boolean;
   outputRoot: string;
   freeGb: number;
   capabilities: Record<CreatorMode, Capability>;
+  llm?: LlmStatus;
 };
 
 type WebMcpContext = {
@@ -75,6 +78,7 @@ function localFetch(input: RequestInfo | URL, init: LocalRequestInit = {}) {
 
 const modes = [
   { id: 'image' as const, label: 'Image', icon: ImageIcon, time: '40–90 sec', engine: 'ComfyUI + RTX GPU' },
+  { id: 'diagram' as const, label: 'Education Diagram', icon: Workflow, time: '2–6 min', engine: 'ComfyUI stages + FFmpeg labels' },
   { id: 'audio' as const, label: 'Audio', icon: Volume2, time: '10–30 sec', engine: 'Windows TTS + Audacity' },
   { id: 'video' as const, label: 'Video', icon: Film, time: '3–10 min', engine: 'ComfyUI + FFmpeg + Shotcut' },
   { id: 'ppt' as const, label: 'PowerPoint', icon: Presentation, time: '20–90 sec', engine: 'LibreOffice Impress' },
@@ -83,6 +87,7 @@ const modes = [
 
 const examples: Record<CreatorMode, string[]> = {
   image: ['Life cycle of a butterfly', 'Seven stages of human life', 'Solar system classroom poster'],
+  diagram: ['Life cycle of a butterfly', 'Water cycle', 'Seven stages of life', 'Custom stages: idea, plan, build, test, launch'],
   audio: ['Welcome to VSB College. Create a clear 30-second introduction.', 'Read this announcement in a calm voice.'],
   video: ['Create a 30-second nature awareness video', 'Make a cinematic college event promo'],
   ppt: ['Natural disasters — 6 slide classroom lesson', 'Introduction to artificial intelligence'],
@@ -90,12 +95,15 @@ const examples: Record<CreatorMode, string[]> = {
 };
 
 const modeLabels: Record<CreatorMode, string> = {
-  image: 'Image', audio: 'Audio', video: 'Video', ppt: 'PowerPoint', markdown: 'Markdown',
+  image: 'Image', diagram: 'Education Diagram', audio: 'Audio', video: 'Video', ppt: 'PowerPoint', markdown: 'Markdown',
 };
 
 async function readJson<T>(response: Response): Promise<T> {
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  const data: unknown = await response.json();
+  if (!response.ok) {
+    const message = typeof data === 'object' && data && 'error' in data ? String(data.error) : `Request failed (${response.status})`;
+    throw new Error(message);
+  }
   return data as T;
 }
 
@@ -118,9 +126,9 @@ function OutputPreview({ job }: { job: Job }) {
     <div id="output-preview" className="mt-4 overflow-hidden rounded-xl border border-primary/20 bg-black/20">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
         <div><p className="text-sm font-semibold">Output preview</p><p className="max-w-[34rem] truncate text-xs text-muted-foreground">{job.outputName}</p></div>
-        <Button asChild size="sm" variant="outline" className="border-white/10 bg-white/5"><a href={job.fileUrl} target="_blank" rel="noreferrer"><Download /> Open original</a></Button>
+        <a href={job.fileUrl} target="_blank" rel="noreferrer" className="inline-flex h-7 items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2.5 text-[0.8rem] font-medium hover:bg-white/10"><Download className="size-3.5" /> Open original</a>
       </div>
-      {job.type === 'image' && <img src={job.fileUrl} alt={job.prompt} className="max-h-[34rem] w-full bg-[#05080a] object-contain" />}
+      {(job.type === 'image' || job.type === 'diagram') && <img src={job.fileUrl} alt={job.prompt} className="max-h-[34rem] w-full bg-[#05080a] object-contain" />}
       {job.type === 'audio' && <div className="p-5"><audio controls preload="metadata" src={job.fileUrl} className="w-full" /></div>}
       {job.type === 'video' && <video controls preload="metadata" src={job.fileUrl} className="max-h-[34rem] w-full bg-black" />}
       {job.type === 'ppt' && job.previewUrl && <iframe title={`${job.outputName} preview`} src={job.previewUrl} className="h-[34rem] w-full bg-white" />}
@@ -223,11 +231,11 @@ export default function StudioClient() {
     void Promise.resolve(context.registerTool({
       name: 'start_local_creation',
       title: 'Start local creation',
-      description: 'Start one offline image, audio, video, PowerPoint, or Markdown job and show it in Local Prompt Studio.',
+      description: 'Start one offline image, education diagram, audio, video, PowerPoint, or Markdown job and show it in Local Prompt Studio.',
       inputSchema: {
         type: 'object',
         properties: {
-          type: { type: 'string', enum: ['image', 'audio', 'video', 'ppt', 'markdown'] },
+          type: { type: 'string', enum: ['image', 'diagram', 'audio', 'video', 'ppt', 'markdown'] },
           prompt: { type: 'string', minLength: 3, maxLength: 4000 },
         },
         required: ['type', 'prompt'],
@@ -236,7 +244,7 @@ export default function StudioClient() {
       annotations: { readOnlyHint: false, untrustedContentHint: false },
       execute: async (input: unknown) => {
         const value = input as { type?: CreatorMode; prompt?: string };
-        if (!value || !['image', 'audio', 'video', 'ppt', 'markdown'].includes(String(value.type)) || typeof value.prompt !== 'string') {
+        if (!value || !['image', 'diagram', 'audio', 'video', 'ppt', 'markdown'].includes(String(value.type)) || typeof value.prompt !== 'string') {
           throw new Error('A valid creation type and prompt are required.');
         }
         return startCreation(value.type as CreatorMode, value.prompt);
@@ -363,6 +371,11 @@ export default function StudioClient() {
             <div className="space-y-3">
               {modes.map((item) => <div key={item.id} className="flex items-center justify-between gap-3 border-b border-white/6 pb-3 text-sm last:border-0 last:pb-0"><span className="text-muted-foreground">{item.label}</span><span className={`font-medium ${system?.capabilities[item.id]?.ready ? 'text-emerald-300' : 'text-muted-foreground'}`}>{system ? (system.capabilities[item.id].ready ? 'Ready' : 'Offline') : 'Checking'}</span></div>)}
             </div>
+            <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-white/8 bg-black/15 px-3 py-2.5 text-sm">
+              <span className="flex items-center gap-2 text-muted-foreground"><Sparkles className="size-3.5" /> AI text engine</span>
+              <span className={`text-right font-medium ${system?.llm?.ready ? 'text-emerald-300' : 'text-muted-foreground'}`}>{system ? (system.llm?.ready ? (system.llm.model || 'Ready') : 'Not connected') : 'Checking'}</span>
+            </div>
+            {system && !system.llm?.ready && <p className="mt-2 text-xs leading-5 text-amber-200/70">Install Ollama and run <code className="rounded bg-black/30 px-1 py-0.5 font-mono">ollama pull llama3.2:3b</code> so PowerPoint and Markdown write real content instead of templates.</p>}
             <div className="mt-5 border-t border-white/8 pt-4">
               <label htmlFor="api-address" className="mb-2 block text-xs font-medium text-muted-foreground">Laptop API address</label>
               <div className="flex gap-2">

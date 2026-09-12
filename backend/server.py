@@ -24,6 +24,7 @@ JOBS_FILE = OUTPUT_ROOT / "jobs.json"
 MAX_JOBS = 50
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
+persist_lock = threading.Lock()
 executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prompt-studio")
 
 
@@ -55,12 +56,16 @@ def public_job(job: dict) -> dict:
 
 
 def persist() -> None:
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    with jobs_lock:
-        snapshot = list(jobs.values())[-MAX_JOBS:]
-    temp = JOBS_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
-    temp.replace(JOBS_FILE)
+    # Multiple generation workers can update progress at the same time. Serialize
+    # the shared temp-file replacement so one worker cannot move it while another
+    # worker is still writing it.
+    with persist_lock:
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        with jobs_lock:
+            snapshot = list(jobs.values())[-MAX_JOBS:]
+        temp = JOBS_FILE.with_suffix(".tmp")
+        temp.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        temp.replace(JOBS_FILE)
 
 
 def load_jobs() -> None:
@@ -230,7 +235,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/generate":
             kind = str(payload.get("type", ""))
             prompt = str(payload.get("prompt", "")).strip()
-            if kind not in {"image", "audio", "video", "ppt", "markdown"}:
+            if kind not in {"image", "diagram", "audio", "video", "ppt", "markdown"}:
                 self.json_response({"error": "Unsupported creation type"}, 400)
                 return
             if len(prompt) < 3 or len(prompt) > 4000:

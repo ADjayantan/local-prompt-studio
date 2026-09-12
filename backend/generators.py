@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import shutil
@@ -21,13 +22,188 @@ SHOTCUT = SCRIPTS / "cli-anything-shotcut.exe"
 FFMPEG = Path(r"D:\CLI-Anything\Apps\FFmpeg\ffmpeg-9.0.1-full_build\bin\ffmpeg.exe")
 FFPROBE = FFMPEG.with_name("ffprobe.exe")
 SPEAK_SCRIPT = Path(__file__).with_name("speak.ps1")
+CONFIG_FILE = Path(__file__).with_name("config.json")
+
+# ---------------------------------------------------------------------------
+# Local LLM (Ollama) — fully offline text generation.
+# After you install Ollama and pull a model once, everything below runs with
+# no internet. Host/model/timeout can be overridden in config.json -> "llm".
+# ---------------------------------------------------------------------------
+OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_TIMEOUT = 180
 
 Progress = Callable[[int, str], None]
+
+
+def _load_llm_config() -> None:
+    global OLLAMA_HOST, OLLAMA_MODEL, OLLAMA_TIMEOUT
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    llm = config.get("llm") if isinstance(config, dict) else None
+    if isinstance(llm, dict):
+        OLLAMA_HOST = str(llm.get("host", OLLAMA_HOST)).rstrip("/")
+        OLLAMA_MODEL = str(llm.get("model", OLLAMA_MODEL))
+        try:
+            OLLAMA_TIMEOUT = int(llm.get("timeoutSeconds", OLLAMA_TIMEOUT))
+        except (TypeError, ValueError):
+            pass
+
+
+_load_llm_config()
+
+
+def ollama_status() -> tuple[bool, str]:
+    """Return (usable, model_name).
+
+    usable is True only when the Ollama server is reachable AND a usable model
+    is installed. Prefers the configured model, tolerates tag differences
+    (llama3.2:3b vs llama3.2:latest), otherwise uses the first installed model.
+    """
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=2) as response:
+            if response.status != 200:
+                return False, ""
+            data = json.loads(response.read().decode("utf-8") or "{}")
+    except Exception:
+        return False, ""
+    models = [str(item.get("name", "")) for item in data.get("models", []) if isinstance(item, dict)]
+    models = [name for name in models if name]
+    if OLLAMA_MODEL in models:
+        return True, OLLAMA_MODEL
+    base = OLLAMA_MODEL.split(":")[0]
+    for name in models:
+        if name.split(":")[0] == base:
+            return True, name
+    if models:
+        return True, models[0]
+    return False, ""
+
+
+def llm_complete(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    temperature: float = 0.4,
+    as_json: bool = False,
+    num_ctx: int = 4096,
+) -> str:
+    """Single-shot completion from the local Ollama server. Raises if offline."""
+    _usable, model = ollama_status()
+    if not model:
+        raise RuntimeError(
+            f"Local LLM is not available. Install Ollama, then run: ollama pull {OLLAMA_MODEL}"
+        )
+    payload: dict = {
+        "model": model,
+        "prompt": user_prompt,
+        "system": system_prompt,
+        "stream": False,
+        "options": {"temperature": temperature, "num_ctx": num_ctx},
+    }
+    if as_json:
+        payload["format"] = "json"
+    request = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT) as response:
+        data = json.loads(response.read().decode("utf-8") or "{}")
+    text = str(data.get("response", "")).strip()
+    if not text:
+        raise RuntimeError("Local LLM returned an empty response")
+    return text
+
+
+def _extract_json(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
+def _clean_markdown(text: str, topic: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    if not text.lstrip().startswith("#"):
+        text = f"# {topic}\n\n{text}"
+    return text
 
 
 def slugify(value: str, limit: int = 54) -> str:
     value = re.sub(r"[^A-Za-z0-9]+", "_", value.strip()).strip("_")
     return (value[:limit] or "creation").strip("_")
+
+
+def parse_duration_seconds(prompt: str, default: float = 30.0, maximum: float = 120.0) -> float:
+    """Read an explicit seconds/minutes duration from a prompt and clamp it safely."""
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(seconds?|secs?|sec|s)\b", prompt, re.IGNORECASE)
+    multiplier = 1.0
+    if not match:
+        match = re.search(r"\b(\d+(?:\.\d+)?)\s*(minutes?|mins?|min|m)\b", prompt, re.IGNORECASE)
+        multiplier = 60.0
+    if not match:
+        return default
+    return max(1.0, min(float(match.group(1)) * multiplier, maximum))
+
+
+def education_stages(prompt: str) -> list[tuple[str, str]]:
+    """Return deterministic labelled subjects for common offline classroom diagrams."""
+    topic = prompt.lower()
+    if "butterfly" in topic:
+        return [
+            ("EGG", "tiny monarch butterfly eggs attached beneath a milkweed leaf"),
+            ("CATERPILLAR", "scientifically accurate striped monarch caterpillar eating a milkweed leaf"),
+            ("CHRYSALIS", "single green monarch chrysalis hanging from a twig"),
+            ("BUTTERFLY", "single adult monarch butterfly with anatomically accurate wings"),
+        ]
+    if "water cycle" in topic:
+        return [
+            ("EVAPORATION", "sun warming a lake while clean water vapor rises"),
+            ("CONDENSATION", "water vapor cooling and forming clouds"),
+            ("PRECIPITATION", "rain falling from clouds over mountains"),
+            ("COLLECTION", "rainwater collecting in rivers lakes and groundwater"),
+        ]
+    if "plant" in topic and ("life cycle" in topic or "lifecycle" in topic):
+        return [
+            ("SEED", "single healthy seed in moist soil"),
+            ("GERMINATION", "seed germinating with first root and shoot"),
+            ("SEEDLING", "young green seedling with first leaves"),
+            ("MATURE PLANT", "mature flowering plant producing new seeds"),
+        ]
+    if "seven stages" in topic or "7 stages" in topic:
+        return [
+            ("INFANT", "newborn infant safely resting"),
+            ("SCHOOLCHILD", "school age child carrying books"),
+            ("TEENAGER", "healthy teenager learning and socializing"),
+            ("YOUNG ADULT", "young adult beginning work and relationships"),
+            ("MIDDLE AGE", "confident middle aged adult with family and career"),
+            ("OLDER ADULT", "active healthy older adult"),
+            ("LATE LIFE", "very old adult supported with dignity and care"),
+        ]
+
+    explicit = re.search(r"\b(?:stages?|steps?)\s*:\s*(.+)", prompt, re.IGNORECASE)
+    if explicit:
+        items = [part.strip(" .") for part in re.split(r",|->|→", explicit.group(1)) if part.strip(" .")]
+        if 2 <= len(items) <= 8:
+            return [(item.upper()[:28], item) for item in items]
+    return [
+        ("BEGINNING", f"the beginning stage of {prompt}"),
+        ("DEVELOPMENT", f"the development stage of {prompt}"),
+        ("TRANSITION", f"the transition stage of {prompt}"),
+        ("COMPLETION", f"the completed stage of {prompt}"),
+    ]
 
 
 def run(command: list[str | Path], timeout: int = 300, json_output: bool = False) -> dict | list | str:
@@ -126,6 +302,78 @@ def generate_image(job_id: str, prompt: str, progress: Progress) -> Path:
     return final_path
 
 
+def generate_diagram(job_id: str, prompt: str, progress: Progress) -> Path:
+    """Generate stage art separately, then assemble truthful labels with FFmpeg."""
+    require(COMFY, "ComfyUI CLI")
+    require(FFMPEG, "FFmpeg")
+    require(FFPROBE, "FFprobe")
+    stages = education_stages(prompt)
+    directory = make_job_dir("diagram", job_id, prompt)
+    stage_images: list[Path] = []
+    generation_span = 76 / len(stages)
+    for index, (label, subject) in enumerate(stages):
+        stage_prompt = (
+            f"One isolated stage illustration for an accurate classroom diagram: {subject}. "
+            "Show only this subject, centered, clean pale background, scientifically plausible, "
+            "no words, no letters, no labels, no extra stages, no duplicate subject"
+        )
+        start = 4 + index * generation_span
+        image = generate_image(
+            f"{job_id}_stage_{index + 1}",
+            stage_prompt,
+            lambda pct, msg, start=start, index=index: progress(
+                min(80, round(start + pct * generation_span / 100)),
+                f"Stage {index + 1}/{len(stages)}: {msg}",
+            ),
+        )
+        stage_images.append(image)
+
+    progress(84, "Assembling fixed labels and stage order")
+    cell_width, cell_height = 512, 384
+    columns = 2 if len(stages) == 4 else min(4, len(stages))
+    rows = math.ceil(len(stages) / columns)
+    width, grid_height = columns * cell_width, rows * cell_height
+    height = grid_height + 72
+    font = "C\\:/Windows/Fonts/arialbd.ttf"
+    filters: list[str] = []
+    labelled_streams: list[str] = []
+    layouts: list[str] = []
+    for index, ((label, _subject), _image) in enumerate(zip(stages, stage_images)):
+        safe_label = re.sub(r"[^A-Za-z0-9 -]", "", label).strip()[:28]
+        filters.append(
+            f"[{index}:v]scale={cell_width}:{cell_height}:force_original_aspect_ratio=increase,"
+            f"crop={cell_width}:{cell_height},drawbox=x=0:y=ih-58:w=iw:h=58:color=black@0.72:t=fill,"
+            f"drawtext=fontfile='{font}':text='{index + 1}. {safe_label}':fontcolor=white:fontsize=28:"
+            f"x=(w-text_w)/2:y=h-text_h-14[v{index}]"
+        )
+        labelled_streams.append(f"[v{index}]")
+        layouts.append(f"{index % columns * cell_width}_{index // columns * cell_height}")
+    filters.append(
+        f"{''.join(labelled_streams)}xstack=inputs={len(stages)}:layout={'|'.join(layouts)}:fill=white[grid]"
+    )
+    safe_title = re.sub(r"[^A-Za-z0-9 -]", "", prompt).strip().upper()[:60] or "EDUCATION DIAGRAM"
+    filters.append(
+        f"[grid]pad={width}:{height}:0:72:color=white,"
+        f"drawtext=fontfile='{font}':text='{safe_title}':fontcolor=black:fontsize=36:"
+        f"x=(w-text_w)/2:y=20[out]"
+    )
+    output = directory / f"{slugify(prompt)}_accurate_diagram.png"
+    command: list[str | Path] = [FFMPEG, "-y"]
+    for image in stage_images:
+        command.extend(["-i", image])
+    command.extend(["-filter_complex", ";".join(filters), "-map", "[out]", "-frames:v", "1", output])
+    run(command, timeout=300)
+    probe = run([
+        FFPROBE, "-v", "error", "-show_entries", "stream=codec_name,width,height", "-of", "json", output,
+    ], timeout=30, json_output=True)
+    streams = probe.get("streams", []) if isinstance(probe, dict) else []
+    valid = bool(streams) and streams[0].get("codec_name") == "png" and streams[0].get("width") == width and streams[0].get("height") == height
+    if not output.exists() or output.stat().st_size < 5000 or not valid:
+        raise RuntimeError("Education diagram verification failed: expected a labelled PNG grid")
+    progress(100, "Accurate education diagram ready")
+    return output
+
+
 def _speak_to_wav(text: str, directory: Path, progress: Progress) -> Path:
     text_file = directory / "speech.txt"
     wav_path = directory / "speech_raw.wav"
@@ -142,18 +390,29 @@ def _speak_to_wav(text: str, directory: Path, progress: Progress) -> Path:
 
 def generate_audio(job_id: str, prompt: str, progress: Progress) -> Path:
     require(AUDACITY, "Audacity CLI")
+    require(FFMPEG, "FFmpeg")
+    require(FFPROBE, "FFprobe")
     directory = make_job_dir("audio", job_id, prompt)
     wav_path = _speak_to_wav(prompt, directory, progress)
     project = directory / "audio.audacity-cli.json"
+    rendered_wav = directory / "audacity_render.wav"
     output = directory / f"{slugify(prompt)}.mp3"
     progress(50, "Creating Audacity project")
     run([AUDACITY, "project", "new", "--name", slugify(prompt), "--sample-rate", "44100", "--channels", "1", "--output", project])
     run([AUDACITY, "--project", project, "track", "add", "--name", "Narration", "--type", "audio"])
     run([AUDACITY, "--project", project, "clip", "add", "0", wav_path, "--name", "Offline narration"])
-    progress(76, "Rendering MP3 with Audacity CLI")
-    run([AUDACITY, "--project", project, "export", "render", output, "--preset", "mp3", "--overwrite"], timeout=180)
-    if not output.exists() or output.stat().st_size < 1000:
-        raise RuntimeError("Audacity CLI did not create a valid MP3")
+    progress(72, "Rendering WAV with Audacity CLI")
+    run([AUDACITY, "--project", project, "export", "render", rendered_wav, "--preset", "wav", "--overwrite"], timeout=180)
+    progress(88, "Encoding real MP3 with FFmpeg")
+    run([FFMPEG, "-y", "-i", rendered_wav, "-codec:a", "libmp3lame", "-b:a", "192k", output], timeout=180)
+    probe = run([
+        FFPROBE, "-v", "error", "-show_entries", "format=format_name,duration,size:stream=codec_name",
+        "-of", "json", output,
+    ], timeout=30, json_output=True)
+    format_name = str(probe.get("format", {}).get("format_name", "")) if isinstance(probe, dict) else ""
+    codecs = {stream.get("codec_name") for stream in probe.get("streams", [])} if isinstance(probe, dict) else set()
+    if not output.exists() or output.stat().st_size < 1000 or "mp3" not in format_name or "mp3" not in codecs:
+        raise RuntimeError("Audio verification failed: expected a real MP3 container and codec")
     progress(100, "Audio ready")
     return output
 
@@ -162,6 +421,8 @@ def generate_video(job_id: str, prompt: str, progress: Progress) -> Path:
     require(SHOTCUT, "Shotcut CLI")
     require(FFMPEG, "FFmpeg")
     directory = make_job_dir("video", job_id, prompt)
+    requested_duration = parse_duration_seconds(prompt)
+    frame_count = max(30, round(requested_duration * 30))
     progress(4, "Creating key visual")
     key_visual = generate_image(f"{job_id}_visual", prompt, lambda pct, msg: progress(min(58, 4 + pct // 2), msg))
     narration = _speak_to_wav(prompt, directory, lambda pct, msg: progress(60 + pct // 10, msg))
@@ -169,9 +430,13 @@ def generate_video(job_id: str, prompt: str, progress: Progress) -> Path:
     progress(68, "Building motion sequence with FFmpeg")
     run([
         FFMPEG, "-y", "-loop", "1", "-i", key_visual, "-i", narration,
-        "-vf", "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,zoompan=z='min(zoom+0.0007,1.08)':d=900:s=1920x1080:fps=30,format=yuv420p",
+        "-filter_complex",
+        f"[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,"
+        f"zoompan=z='min(zoom+0.0007,1.08)':d={frame_count}:s=1920x1080:fps=30,format=yuv420p[v];"
+        f"[1:a]apad=whole_dur={requested_duration}[a]",
+        "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "fast", "-tune", "stillimage", "-c:a", "aac", "-b:a", "192k",
-        "-shortest", "-t", "30", source,
+        "-t", str(requested_duration), source,
     ], timeout=600)
     if not source.exists() or source.stat().st_size < 10000:
         raise RuntimeError("FFmpeg did not create a valid source video")
@@ -195,12 +460,69 @@ def generate_video(job_id: str, prompt: str, progress: Progress) -> Path:
         FFPROBE, "-v", "error", "-show_entries", "format=duration,size:stream=codec_name,width,height",
         "-of", "json", output,
     ], timeout=30, json_output=True)
-    duration = float(probe.get("format", {}).get("duration", 0)) if isinstance(probe, dict) else 0
+    actual_duration = float(probe.get("format", {}).get("duration", 0)) if isinstance(probe, dict) else 0
     codecs = {stream.get("codec_name") for stream in probe.get("streams", [])} if isinstance(probe, dict) else set()
-    if not output.exists() or output.stat().st_size < 10000 or duration < 1 or "h264" not in codecs:
-        raise RuntimeError("Video verification failed: expected a playable H.264 MP4")
+    if not output.exists() or output.stat().st_size < 10000 or abs(requested_duration - actual_duration) > 0.35 or "h264" not in codecs or "aac" not in codecs:
+        raise RuntimeError(f"Video verification failed: expected a playable {requested_duration:g}-second H.264/AAC MP4")
     progress(100, "Video ready")
     return output
+
+
+def _ppt_template_slides(topic: str) -> list[tuple[str, str]]:
+    """Deterministic offline fallback used when no local LLM is available."""
+    return [
+        (topic, "A locally generated presentation\nCreated with CLI-Anything + LibreOffice"),
+        ("Overview", f"What {topic} means\nWhy this topic matters\nWhat this presentation covers"),
+        ("Key ideas", f"Core concepts behind {topic}\nImportant terms and relationships\nA simple way to remember the topic"),
+        ("How it works", f"Step-by-step view of {topic}\nInputs, process, and outcomes\nConnections between each stage"),
+        ("Examples and applications", f"Real-world examples of {topic}\nWhere we see it in daily life\nPractical uses and observations"),
+        ("Summary", f"Main lessons from {topic}\nQuestions for discussion\nThank you"),
+    ]
+
+
+def _parse_slides_json(raw: str) -> list[tuple[str, str]]:
+    try:
+        data = json.loads(_extract_json(raw))
+    except (ValueError, json.JSONDecodeError):
+        return []
+    items = data.get("slides") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    slides: list[tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        raw_bullets = item.get("bullets", item.get("content", []))
+        if isinstance(raw_bullets, str):
+            lines = [line.strip() for line in raw_bullets.splitlines() if line.strip()]
+        elif isinstance(raw_bullets, list):
+            lines = [str(bullet).strip().lstrip("-•*0123456789. ").strip() for bullet in raw_bullets]
+        else:
+            lines = []
+        lines = [line for line in lines if line]
+        if not title and not lines:
+            continue
+        slides.append((title or "Slide", "\n".join(lines)))
+    return slides[:8]
+
+
+def _ppt_llm_slides(topic: str) -> list[tuple[str, str]]:
+    system_prompt = (
+        "You are a presentation designer. You produce clear, accurate, classroom-ready "
+        "slides and return STRICT JSON only, with no commentary."
+    )
+    user_prompt = (
+        f'Create a slide deck about: "{topic}".\n'
+        'Return JSON exactly of the form: {"slides":[{"title":"...","bullets":["...","..."]}]}\n'
+        "Rules: 5 to 7 slides total. The first slide is a title slide (its bullets hold a "
+        "one-line subtitle). Every other slide has 3 to 5 short bullet points, each under "
+        "about 12 words. Plain text bullets only — no markdown, no numbering."
+    )
+    slides = _parse_slides_json(llm_complete(system_prompt, user_prompt, temperature=0.4, as_json=True))
+    if len(slides) < 3:
+        raise RuntimeError("Local LLM did not return enough usable slides")
+    return slides
 
 
 def generate_ppt(job_id: str, prompt: str, progress: Progress) -> Path:
@@ -210,19 +532,24 @@ def generate_ppt(job_id: str, prompt: str, progress: Progress) -> Path:
     output = directory / f"{slugify(prompt)}.pptx"
     preview = output.with_suffix(".pdf")
     topic = prompt.strip().rstrip(".")
-    slides = [
-        (topic, "A locally generated presentation\nCreated with CLI-Anything + LibreOffice"),
-        ("Overview", f"What {topic} means\nWhy this topic matters\nWhat this presentation covers"),
-        ("Key ideas", f"Core concepts behind {topic}\nImportant terms and relationships\nA simple way to remember the topic"),
-        ("How it works", f"Step-by-step view of {topic}\nInputs, process, and outcomes\nConnections between each stage"),
-        ("Examples and applications", f"Real-world examples of {topic}\nWhere we see it in daily life\nPractical uses and observations"),
-        ("Summary", f"Main lessons from {topic}\nQuestions for discussion\nThank you"),
-    ]
+
+    slides: list[tuple[str, str]] | None = None
+    usable, _model = ollama_status()
+    if usable:
+        progress(8, "Writing slide content with local AI")
+        try:
+            slides = _ppt_llm_slides(topic)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully to template
+            print(f"[ppt] Local LLM generation failed, using template: {exc}")
+            slides = None
+    if not slides:
+        slides = _ppt_template_slides(topic)
+
     progress(12, "Creating LibreOffice Impress project")
     run([LIBREOFFICE, "document", "new", "--type", "impress", "--name", topic, "--profile", "presentation_16_9", "--output", project])
     for index, (title, content) in enumerate(slides):
         run([LIBREOFFICE, "--project", project, "impress", "add-slide", "--title", title, "--content", content])
-        progress(18 + index * 10, f"Writing slide {index + 1} of {len(slides)}")
+        progress(min(80, 18 + index * 9), f"Writing slide {index + 1} of {len(slides)}")
     progress(84, "Rendering PPTX with LibreOffice")
     run([LIBREOFFICE, "--project", project, "export", "render", output, "--preset", "pptx", "--overwrite"], timeout=300)
     if not output.exists() or output.stat().st_size < 1000 or output.read_bytes()[:2] != b"PK":
@@ -235,12 +562,9 @@ def generate_ppt(job_id: str, prompt: str, progress: Progress) -> Path:
     return output
 
 
-def generate_markdown(job_id: str, prompt: str, progress: Progress) -> Path:
-    directory = make_job_dir("markdown", job_id, prompt)
-    output = directory / f"{slugify(prompt)}.md"
-    topic = prompt.strip().rstrip(".")
-    progress(35, "Building local Markdown template")
-    body = f"""# {topic}
+def _markdown_template(topic: str) -> str:
+    """Deterministic offline fallback used when no local LLM is available."""
+    return f"""# {topic}
 
 ## Overview
 
@@ -267,11 +591,41 @@ This document is a structured offline starting point for **{topic}**.
 ## Summary
 
 {topic} can be understood by connecting its purpose, core ideas, and real-world applications.
-
----
-
-Generated fully offline by Local Prompt Studio.
 """
+
+
+def generate_markdown(job_id: str, prompt: str, progress: Progress) -> Path:
+    directory = make_job_dir("markdown", job_id, prompt)
+    output = directory / f"{slugify(prompt)}.md"
+    topic = prompt.strip().rstrip(".")
+
+    body: str | None = None
+    usable, _model = ollama_status()
+    if usable:
+        progress(25, "Writing document with local AI")
+        try:
+            system_prompt = (
+                "You are a precise technical writer. Write a well-structured, accurate Markdown "
+                "document. Use headings, short paragraphs, and bullet lists where useful. Do not "
+                "wrap the whole document in a code fence."
+            )
+            user_prompt = (
+                f'Write a complete Markdown document for this request: "{prompt}".\n'
+                f'Start with a level-1 heading titled "{topic}". Include an overview, several '
+                "sections with real explanatory content, and a short summary at the end."
+            )
+            body = _clean_markdown(
+                llm_complete(system_prompt, user_prompt, temperature=0.5, num_ctx=8192),
+                topic,
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully to template
+            print(f"[markdown] Local LLM generation failed, using template: {exc}")
+            body = None
+    if not body:
+        progress(35, "Building local Markdown template")
+        body = _markdown_template(topic)
+
+    body = body.rstrip() + "\n\n---\n\n_Generated fully offline by Local Prompt Studio._\n"
     output.write_text(body, encoding="utf-8")
     progress(100, "Markdown ready")
     return output
@@ -279,6 +633,7 @@ Generated fully offline by Local Prompt Studio.
 
 GENERATORS = {
     "image": generate_image,
+    "diagram": generate_diagram,
     "audio": generate_audio,
     "video": generate_video,
     "ppt": generate_ppt,
@@ -304,16 +659,21 @@ def capability_status() -> dict:
             comfy_online = response.status == 200
     except Exception:
         pass
+    llm_ready, llm_model = ollama_status()
+    ppt_engine = "LibreOffice Impress + local AI" if llm_ready else "LibreOffice Impress (template)"
+    markdown_engine = "Local AI writer" if llm_ready else "Local template"
     usage = shutil.disk_usage(OUTPUT_ROOT.anchor)
     return {
         "offline": True,
         "outputRoot": str(OUTPUT_ROOT),
         "freeGb": round(usage.free / (1024**3), 1),
+        "llm": {"ready": llm_ready, "engine": "Ollama", "model": llm_model, "host": OLLAMA_HOST},
         "capabilities": {
             "image": {"ready": COMFY.exists() and comfy_online, "engine": "ComfyUI + RTX GPU"},
-            "audio": {"ready": AUDACITY.exists() and SPEAK_SCRIPT.exists(), "engine": "Windows TTS + Audacity"},
+            "diagram": {"ready": COMFY.exists() and FFMPEG.exists() and comfy_online, "engine": "ComfyUI stages + FFmpeg layout"},
+            "audio": {"ready": AUDACITY.exists() and FFMPEG.exists() and SPEAK_SCRIPT.exists(), "engine": "Windows TTS + Audacity + FFmpeg MP3"},
             "video": {"ready": SHOTCUT.exists() and FFMPEG.exists() and comfy_online, "engine": "ComfyUI + FFmpeg + Shotcut"},
-            "ppt": {"ready": LIBREOFFICE.exists(), "engine": "LibreOffice Impress"},
-            "markdown": {"ready": True, "engine": "Local template"},
+            "ppt": {"ready": LIBREOFFICE.exists(), "engine": ppt_engine},
+            "markdown": {"ready": True, "engine": markdown_engine},
         },
     }
