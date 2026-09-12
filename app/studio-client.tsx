@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -12,6 +12,7 @@ import {
   FolderOpen,
   HardDrive,
   Image as ImageIcon,
+  ImagePlus,
   Laptop,
   LoaderCircle,
   Presentation,
@@ -31,6 +32,13 @@ import { Progress } from '@/components/ui/progress';
 import { Textarea } from '@/components/ui/textarea';
 
 type CreatorMode = 'image' | 'diagram' | 'audio' | 'video' | 'ppt' | 'markdown';
+type ImageStrength = 'polish' | 'rework' | 'reimagine';
+
+const STRENGTHS: { id: ImageStrength; label: string; hint: string }[] = [
+  { id: 'polish', label: 'Polish', hint: 'Keep the photo, clean it up and sharpen it' },
+  { id: 'rework', label: 'Rework', hint: 'Same composition, noticeable changes' },
+  { id: 'reimagine', label: 'Reimagine', hint: 'Follow the prompt, keep only the layout' },
+];
 type JobStatus = 'queued' | 'running' | 'complete' | 'error';
 
 type Job = {
@@ -149,6 +157,10 @@ export default function StudioClient() {
   const [remoteConnectionRequested, setRemoteConnectionRequested] = useState(false);
   const [apiBase, setApiBase] = useState(DEFAULT_API);
   const [apiDraft, setApiDraft] = useState(DEFAULT_API);
+  const [sourceImage, setSourceImage] = useState<{ id: string; name: string; preview: string } | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [strength, setStrength] = useState<ImageStrength>('rework');
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const active = useMemo(() => modes.find((item) => item.id === mode)!, [mode]);
   const busy = job?.status === 'queued' || job?.status === 'running';
 
@@ -208,20 +220,48 @@ export default function StudioClient() {
     return () => window.clearInterval(timer);
   }, [apiBase, job, refresh]);
 
+  const uploadSourceImage = useCallback(async (file: File) => {
+    setUploading(true);
+    try {
+      const { uploadId } = await localFetch(`${apiBase}/api/uploads`, {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'image/png' },
+        body: file,
+      }).then((response) => readJson<{ uploadId: string }>(response));
+      setSourceImage((previous) => {
+        if (previous) URL.revokeObjectURL(previous.preview);
+        return { id: uploadId, name: file.name, preview: URL.createObjectURL(file) };
+      });
+      setServerError('');
+    } catch (error) {
+      setServerError(error instanceof Error ? error.message : 'Could not upload that image');
+    } finally {
+      setUploading(false);
+    }
+  }, [apiBase]);
+
+  const clearSourceImage = useCallback(() => {
+    setSourceImage((previous) => {
+      if (previous) URL.revokeObjectURL(previous.preview);
+      return null;
+    });
+  }, []);
+
   const startCreation = useCallback(async (creationType: CreatorMode, creationPrompt: string) => {
     const cleanPrompt = creationPrompt.trim();
     if (cleanPrompt.length < 3) throw new Error('Please enter a prompt with at least 3 characters.');
+    const uploadId = creationType === 'image' ? sourceImage?.id : undefined;
     const created = await localFetch(`${apiBase}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: creationType, prompt: cleanPrompt }),
+      body: JSON.stringify({ type: creationType, prompt: cleanPrompt, ...(uploadId ? { uploadId, strength } : {}) }),
     }).then((response) => readJson<Job>(response));
     setMode(creationType);
     setPrompt(cleanPrompt);
     setJob(created);
     setServerError('');
     return { id: created.id, status: created.status, type: created.type };
-  }, [apiBase]);
+  }, [apiBase, sourceImage, strength]);
 
   useEffect(() => {
     const context = (document as Document & { modelContext?: WebMcpContext }).modelContext;
@@ -328,6 +368,62 @@ export default function StudioClient() {
               </div>
               <Badge variant="outline" className="h-7 border-white/10 bg-white/4 px-3 text-muted-foreground">Estimated {active.time}</Badge>
             </div>
+
+            {mode === 'image' && (
+              <div className="mb-4 rounded-2xl border border-white/10 bg-white/[0.02] p-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    {sourceImage
+                      ? <img src={sourceImage.preview} alt="What you uploaded to start from" className="size-12 rounded-lg border border-white/10 object-cover" />
+                      : <span className="grid size-12 place-items-center rounded-lg border border-dashed border-white/15 text-muted-foreground"><ImagePlus className="size-5" /></span>}
+                    <div className="text-sm">
+                      <p className="font-semibold">Start from an image <span className="font-normal text-muted-foreground">(optional)</span></p>
+                      <p className="text-xs text-muted-foreground">{sourceImage ? sourceImage.name : 'Upload a PNG or JPEG and the prompt will rework it.'}</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg"
+                      className="sr-only"
+                      disabled={busy || uploading}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = '';
+                        if (file) void uploadSourceImage(file);
+                      }}
+                    />
+                    <Button type="button" size="sm" variant="outline" disabled={busy || uploading} onClick={() => fileInputRef.current?.click()} className="border-white/12 bg-white/5">
+                      {uploading ? <LoaderCircle className="animate-spin" /> : <ImagePlus />}{uploading ? 'Uploading…' : sourceImage ? 'Replace' : 'Choose image'}
+                    </Button>
+                    {sourceImage && <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={clearSourceImage} className="text-muted-foreground">Remove</Button>}
+                  </div>
+                </div>
+                {sourceImage && (
+                  <div className="mt-3 border-t border-white/7 pt-3">
+                    <p className="mb-2 text-xs font-semibold text-muted-foreground">How much should it change?</p>
+                    <div className="flex flex-wrap gap-2">
+                      {STRENGTHS.map((option) => (
+                        <Button
+                          key={option.id}
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          title={option.hint}
+                          onClick={() => setStrength(option.id)}
+                          className={`rounded-full px-3 text-xs ${strength === option.id ? 'bg-primary/15 text-primary hover:bg-primary/20 hover:text-primary' : 'bg-white/5 text-muted-foreground hover:bg-white/10 hover:text-foreground'}`}
+                        >
+                          {option.label}
+                        </Button>
+                      ))}
+                    </div>
+                    <p className="mt-2 text-xs text-muted-foreground">{STRENGTHS.find((option) => option.id === strength)?.hint}</p>
+                  </div>
+                )}
+              </div>
+            )}
 
             <label htmlFor="prompt" className="mb-2 block text-sm font-semibold">Your prompt</label>
             <div className="rounded-2xl border border-white/10 bg-[#0a0f13] p-2 transition focus-within:border-primary/45 focus-within:ring-4 focus-within:ring-primary/5">

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +33,24 @@ CONFIG_FILE = Path(__file__).with_name("config.json")
 OLLAMA_HOST = "http://127.0.0.1:11434"
 OLLAMA_MODEL = "llama3.2:3b"
 OLLAMA_TIMEOUT = 180
+
+COMFY_HOST = "http://127.0.0.1:8188"
+# Generation size. The RTX 5050 has 8GB of VRAM, so stay here and gain detail from the
+# upscaler instead of sampling a larger latent.
+IMAGE_WIDTH, IMAGE_HEIGHT = 1024, 768
+# How far an uploaded image is allowed to move. Keeping a photo and restyling it want
+# opposite settings, so this is the caller's choice rather than one compromise value.
+IMG2IMG_STRENGTHS = {"polish": 0.35, "rework": 0.65, "reimagine": 0.92}
+DEFAULT_IMG2IMG_STRENGTH = "rework"
+# Text-to-image is fine at cfg 1.0, which is what Z-Image Turbo is distilled for. Image
+# -to-image is not: with no classifier-free guidance the input latent overwhelms the
+# prompt, and asking to recolour a flower was measured returning the original colour on
+# some seeds and a half-and-half blend on others. Guidance against a real negative
+# prompt — a zeroed-out one is too weak to help — made it consistent.
+IMG2IMG_CFG = 2.5
+IMG2IMG_NEGATIVE = (
+    "blurry, soft focus, low detail, low quality, washed out, watermark, text, duplicated subject"
+)
 
 Progress = Callable[[int, str], None]
 
@@ -80,6 +99,58 @@ def ollama_status() -> tuple[bool, str]:
     if models:
         return True, models[0]
     return False, ""
+
+
+def comfy_upload_image(source: Path) -> str:
+    """Put a local file into ComfyUI's input folder and return the name it stored it as."""
+    boundary = f"----PromptStudio{uuid.uuid4().hex}"
+    suffix = source.suffix.lower()
+    mime = "image/jpeg" if suffix in {".jpg", ".jpeg"} else f"image/{suffix.lstrip('.') or 'png'}"
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="image"; filename="{source.name}"\r\n'.encode(),
+        f"Content-Type: {mime}\r\n\r\n".encode(),
+        source.read_bytes(),
+        f"\r\n--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="overwrite"\r\n\r\ntrue\r\n',
+        f"--{boundary}--\r\n".encode(),
+    ])
+    request = urllib.request.Request(
+        f"{COMFY_HOST}/upload/image",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        data = json.loads(response.read().decode("utf-8") or "{}")
+    name = str(data.get("name", "")).strip()
+    if not name:
+        raise RuntimeError(f"ComfyUI rejected the uploaded image: {data}")
+    subfolder = str(data.get("subfolder", "")).strip()
+    return f"{subfolder}/{name}" if subfolder else name
+
+
+_upscaler_cache: list[str] | None = None
+
+
+def upscale_model_name() -> str:
+    """The installed ESRGAN-style upscaler, or "" when none is present.
+
+    Cached because a diagram renders one image per stage and would otherwise ask
+    ComfyUI the same question on every one.
+    """
+    global _upscaler_cache
+    if _upscaler_cache is None:
+        try:
+            with urllib.request.urlopen(f"{COMFY_HOST}/models/upscale_models", timeout=3) as response:
+                names = json.loads(response.read().decode("utf-8") or "[]")
+            _upscaler_cache = [str(name) for name in names if str(name).endswith((".pth", ".safetensors"))]
+        except Exception:
+            return ""
+    for name in _upscaler_cache:
+        if "realesrgan" in name.lower():
+            return name
+    return _upscaler_cache[0] if _upscaler_cache else ""
 
 
 def llm_complete(
@@ -326,7 +397,13 @@ def make_job_dir(kind: str, job_id: str, prompt: str) -> Path:
     return directory
 
 
-def generate_image(job_id: str, prompt: str, progress: Progress) -> Path:
+def generate_image(
+    job_id: str,
+    prompt: str,
+    progress: Progress,
+    source_image: Path | None = None,
+    strength: str = DEFAULT_IMG2IMG_STRENGTH,
+) -> Path:
     require(COMFY, "ComfyUI CLI")
     directory = make_job_dir("image", job_id, prompt)
     workflow_path = directory / "workflow.json"
@@ -341,7 +418,7 @@ def generate_image(job_id: str, prompt: str, progress: Progress) -> Path:
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": refined_prompt}},
         "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
-        "6": {"class_type": "EmptySD3LatentImage", "inputs": {"width": 1024, "height": 768, "batch_size": 1}},
+        "6": {"class_type": "EmptySD3LatentImage", "inputs": {"width": IMAGE_WIDTH, "height": IMAGE_HEIGHT, "batch_size": 1}},
         "7": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["1", 0], "shift": 3.0}},
         "8": {
             "class_type": "KSampler",
@@ -353,7 +430,44 @@ def generate_image(job_id: str, prompt: str, progress: Progress) -> Path:
             },
         },
         "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
-        "10": {"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": f"PromptStudio/{job_id}/render"}},
+    }
+    if source_image is not None:
+        progress(6, "Uploading your image to the GPU engine")
+        uploaded = comfy_upload_image(source_image)
+        workflow["14"] = {"class_type": "LoadImage", "inputs": {"image": uploaded}}
+        # Fit the upload to the same pixel budget the model samples at — a phone photo
+        # would otherwise build a latent far too large for 8GB of VRAM.
+        workflow["15"] = {
+            "class_type": "ImageScaleToTotalPixels",
+            "inputs": {
+                "image": ["14", 0], "upscale_method": "lanczos",
+                "megapixels": round(IMAGE_WIDTH * IMAGE_HEIGHT / 1_000_000, 2),
+                "resolution_steps": 8,
+            },
+        }
+        workflow["16"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["15", 0], "vae": ["3", 0]}}
+        workflow["5"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": IMG2IMG_NEGATIVE}}
+        workflow["8"]["inputs"]["latent_image"] = ["16", 0]
+        workflow["8"]["inputs"]["denoise"] = IMG2IMG_STRENGTHS[strength]
+        workflow["8"]["inputs"]["cfg"] = IMG2IMG_CFG
+        del workflow["6"]
+    upscaler = upscale_model_name()
+    if upscaler:
+        # Upscale 4x then resample down to 2x: sharper than generating at 2x directly,
+        # and it runs after the VAE decode, so it costs far less VRAM than a big latent.
+        workflow["11"] = {"class_type": "UpscaleModelLoader", "inputs": {"model_name": upscaler}}
+        workflow["12"] = {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["11", 0], "image": ["9", 0]}}
+        workflow["13"] = {
+            "class_type": "ImageScale",
+            "inputs": {
+                "image": ["12", 0], "upscale_method": "lanczos",
+                "width": IMAGE_WIDTH * 2, "height": IMAGE_HEIGHT * 2, "crop": "disabled",
+            },
+        }
+    final_image = "13" if upscaler else "9"
+    workflow["10"] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": [final_image, 0], "filename_prefix": f"PromptStudio/{job_id}/render"},
     }
     workflow_path.write_text(json.dumps(workflow, indent=2), encoding="utf-8")
     progress(8, "Validating ComfyUI workflow")
@@ -740,7 +854,14 @@ GENERATORS = {
 }
 
 
-def generate(kind: str, job_id: str, prompt: str, progress: Progress) -> Path:
+def generate(
+    kind: str,
+    job_id: str,
+    prompt: str,
+    progress: Progress,
+    source_image: Path | None = None,
+    strength: str = DEFAULT_IMG2IMG_STRENGTH,
+) -> Path:
     if kind not in GENERATORS:
         raise ValueError(f"Unsupported creation type: {kind}")
     clean_prompt = prompt.strip()
@@ -748,13 +869,19 @@ def generate(kind: str, job_id: str, prompt: str, progress: Progress) -> Path:
         raise ValueError("Prompt must contain at least 3 characters")
     if len(clean_prompt) > 4000:
         raise ValueError("Prompt is too long; maximum is 4000 characters")
+    if source_image is not None:
+        if kind != "image":
+            raise ValueError("A source image can only be used in Image mode")
+        if strength not in IMG2IMG_STRENGTHS:
+            raise ValueError(f"Unknown strength: {strength}")
+        return generate_image(job_id, clean_prompt, progress, source_image, strength)
     return GENERATORS[kind](job_id, clean_prompt, progress)
 
 
 def capability_status() -> dict:
     comfy_online = False
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=2) as response:
+        with urllib.request.urlopen(f"{COMFY_HOST}/system_stats", timeout=2) as response:
             comfy_online = response.status == 200
     except Exception:
         pass
