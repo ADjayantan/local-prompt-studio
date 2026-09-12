@@ -143,8 +143,31 @@ def parse_duration_seconds(prompt: str, default: float = 30.0, maximum: float = 
     return max(1.0, min(float(match.group(1)) * multiplier, maximum))
 
 
-def education_stages(prompt: str) -> list[tuple[str, str]]:
-    """Return deterministic labelled subjects for common offline classroom diagrams."""
+STAGE_CLAUSE = re.compile(r"\b(?:stages?|steps?)\s*:\s*(.+)", re.IGNORECASE)
+
+
+def explicit_stage_names(prompt: str) -> list[str]:
+    """Read a user-supplied "stages: a, b, c" clause, if there is a usable one."""
+    match = STAGE_CLAUSE.search(prompt)
+    if not match:
+        return []
+    items = [part.strip(" .") for part in re.split(r",|->|→", match.group(1)) if part.strip(" .")]
+    return items if 2 <= len(items) <= 8 else []
+
+
+def diagram_subject(prompt: str) -> str:
+    """The topic without its stage list, so a bare stage word never loses its subject."""
+    return STAGE_CLAUSE.sub("", prompt).strip(" .,:-") or prompt.strip()
+
+
+def diagram_title(prompt: str, limit: int = 60) -> str:
+    """Drop the stage list from the heading — the labels under each panel already say it."""
+    text = re.sub(r"[^A-Za-z0-9 -]", " ", diagram_subject(prompt))
+    return " ".join(text.split()).upper()[:limit] or "EDUCATION DIAGRAM"
+
+
+def preset_stages(prompt: str) -> list[tuple[str, str]]:
+    """Hand-checked stage art briefs for the topics classrooms ask for most."""
     topic = prompt.lower()
     if "butterfly" in topic:
         return [
@@ -177,18 +200,98 @@ def education_stages(prompt: str) -> list[tuple[str, str]]:
             ("OLDER ADULT", "active healthy older adult"),
             ("LATE LIFE", "very old adult supported with dignity and care"),
         ]
+    return []
 
-    explicit = re.search(r"\b(?:stages?|steps?)\s*:\s*(.+)", prompt, re.IGNORECASE)
+
+def education_stages(prompt: str) -> list[tuple[str, str]]:
+    """Resolve stages without the local model — presets, then an explicit list, then a
+    last-resort generic outline."""
+    preset = preset_stages(prompt)
+    if preset:
+        return preset
+
+    explicit = explicit_stage_names(prompt)
     if explicit:
-        items = [part.strip(" .") for part in re.split(r",|->|→", explicit.group(1)) if part.strip(" .")]
-        if 2 <= len(items) <= 8:
-            return [(item.upper()[:28], item) for item in items]
+        subject = diagram_subject(prompt)
+        return [(item.upper()[:28], f"the {item} stage of {subject}") for item in explicit]
     return [
         ("BEGINNING", f"the beginning stage of {prompt}"),
         ("DEVELOPMENT", f"the development stage of {prompt}"),
         ("TRANSITION", f"the transition stage of {prompt}"),
         ("COMPLETION", f"the completed stage of {prompt}"),
     ]
+
+
+def _parse_stage_briefs(raw: str) -> list[tuple[str, str]]:
+    """Read the model's STAGE:/VISUAL: pairs."""
+    stages: list[tuple[str, str]] = []
+    label = ""
+    for line in raw.splitlines():
+        line = line.strip().lstrip("-•*").strip()
+        stage_match = re.match(r"^STAGE\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if stage_match:
+            label = re.sub(r"[^A-Za-z0-9 -]", "", stage_match.group(1)).strip()[:28]
+            continue
+        visual_match = re.match(r"^VISUAL\s*[:\-]\s*(.+)$", line, re.IGNORECASE)
+        if visual_match and label:
+            stages.append((label.upper(), visual_match.group(1).strip()))
+            label = ""
+    return stages[:8]
+
+
+def llm_stage_briefs(subject: str, labels: list[str] | None = None) -> list[tuple[str, str]]:
+    """Ask the local model what each stage actually looks like.
+
+    The image model only ever sees a short phrase, so a bare stage word like "egg"
+    makes it draw a chicken egg. This turns each stage into a concrete brief that
+    names the organism, which is what the diagram accuracy depends on.
+    """
+    if labels:
+        instruction = (
+            "Write one visual brief for each of these stages, in exactly this order: "
+            + ", ".join(labels)
+            + ".\nKeep these stage labels exactly as given.\n"
+        )
+    else:
+        instruction = "List its real stages in correct order — 3 to 6 of them.\n"
+    system_prompt = (
+        "You are a science teacher briefing a classroom illustrator. You state exactly "
+        "what each stage physically looks like, in plain text only."
+    )
+    user_prompt = (
+        f'Topic: "{subject}".\n'
+        + instruction
+        + "Respond using EXACTLY this format and nothing else:\n"
+        "STAGE: <short label, 1 to 3 words>\n"
+        "VISUAL: <one sentence describing what this stage looks like>\n"
+        "Repeat that pair for every stage. Each VISUAL sentence must name the organism "
+        "or object concretely and describe its size, colour and surroundings, so an "
+        "illustrator cannot confuse it with a different species or object. Never write "
+        "a bare word. No commentary, no markdown, no numbering."
+    )
+    stages = _parse_stage_briefs(llm_complete(system_prompt, user_prompt, temperature=0.3))
+    if labels:
+        if len(stages) < len(labels):
+            raise RuntimeError("Local LLM skipped one of the requested stages")
+        return [(label.upper()[:28], visual) for label, (_parsed, visual) in zip(labels, stages)]
+    if len(stages) < 3:
+        raise RuntimeError("Local LLM did not return enough usable stages")
+    return stages
+
+
+def diagram_stages(prompt: str) -> list[tuple[str, str]]:
+    """Best available stage briefs: curated presets, then the local model, then the
+    deterministic fallback."""
+    preset = preset_stages(prompt)
+    if preset:
+        return preset
+    subject = diagram_subject(prompt)
+    explicit = explicit_stage_names(prompt)
+    try:
+        return llm_stage_briefs(subject, explicit or None)
+    except Exception as exc:  # noqa: BLE001 - the diagram must still render offline
+        print(f"[diagram] Local LLM stage research failed, using fallback: {exc}")
+        return education_stages(prompt)
 
 
 def run(command: list[str | Path], timeout: int = 300, json_output: bool = False) -> dict | list | str:
@@ -292,7 +395,7 @@ def generate_diagram(job_id: str, prompt: str, progress: Progress) -> Path:
     require(COMFY, "ComfyUI CLI")
     require(FFMPEG, "FFmpeg")
     require(FFPROBE, "FFprobe")
-    stages = education_stages(prompt)
+    stages = diagram_stages(prompt)
     directory = make_job_dir("diagram", job_id, prompt)
     stage_images: list[Path] = []
     generation_span = 76 / len(stages)
@@ -336,11 +439,13 @@ def generate_diagram(job_id: str, prompt: str, progress: Progress) -> Path:
     filters.append(
         f"{''.join(labelled_streams)}xstack=inputs={len(stages)}:layout={'|'.join(layouts)}:fill=white[grid]"
     )
-    safe_title = re.sub(r"[^A-Za-z0-9 -]", "", prompt).strip().upper()[:60] or "EDUCATION DIAGRAM"
+    safe_title = diagram_title(prompt)
+    # Arial Bold runs about 0.62 em per character; shrink until the heading fits the canvas.
+    title_size = max(16, min(36, int((width - 48) / (0.62 * len(safe_title)))))
     filters.append(
         f"[grid]pad={width}:{height}:0:72:color=white,"
-        f"drawtext=fontfile='{font}':text='{safe_title}':fontcolor=black:fontsize=36:"
-        f"x=(w-text_w)/2:y=20[out]"
+        f"drawtext=fontfile='{font}':text='{safe_title}':fontcolor=black:fontsize={title_size}:"
+        f"x=(w-text_w)/2:y=(72-text_h)/2[out]"
     )
     output = directory / f"{slugify(prompt)}_accurate_diagram.png"
     command: list[str | Path] = [FFMPEG, "-y"]

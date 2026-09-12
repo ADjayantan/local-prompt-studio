@@ -9,7 +9,15 @@ BACKEND = Path(__file__).resolve().parents[1]
 if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
-from generators import _parse_slides_text, education_stages, parse_duration_seconds  # noqa: E402
+from generators import (  # noqa: E402
+    _parse_slides_text,
+    _parse_stage_briefs,
+    diagram_subject,
+    diagram_title,
+    education_stages,
+    explicit_stage_names,
+    parse_duration_seconds,
+)
 
 
 class GeneratorLogicTests(unittest.TestCase):
@@ -62,6 +70,42 @@ class GeneratorLogicTests(unittest.TestCase):
 
     def test_slide_text_returns_nothing_for_unusable_output(self) -> None:
         self.assertEqual(_parse_slides_text("   "), [])
+
+    def test_explicit_stage_names_needs_two_to_eight_items(self) -> None:
+        self.assertEqual(explicit_stage_names("Frog stages: egg, tadpole"), ["egg", "tadpole"])
+        self.assertEqual(explicit_stage_names("Frog stages: egg"), [])
+        self.assertEqual(explicit_stage_names("Frog life cycle"), [])
+
+    def test_explicit_stage_descriptions_keep_the_subject(self) -> None:
+        stages = education_stages("Frog life cycle stages: egg, tadpole, froglet, adult frog")
+        self.assertEqual(stages[0][0], "EGG")
+        self.assertIn("Frog life cycle", stages[0][1])
+
+    def test_diagram_title_drops_the_stage_list(self) -> None:
+        self.assertEqual(
+            diagram_title("Frog life cycle for classroom stages: egg, tadpole, froglet"),
+            "FROG LIFE CYCLE FOR CLASSROOM",
+        )
+
+    def test_diagram_subject_survives_a_bare_prompt(self) -> None:
+        self.assertEqual(diagram_subject("Water cycle"), "Water cycle")
+
+    def test_stage_briefs_are_parsed_into_labels_and_visuals(self) -> None:
+        raw = (
+            "STAGE: Egg\nVISUAL: A jelly cluster of frog spawn floating in a pond.\n"
+            "STAGE: Tadpole\nVISUAL: A small black tadpole with a long tail swimming.\n"
+        )
+        self.assertEqual(
+            _parse_stage_briefs(raw),
+            [
+                ("EGG", "A jelly cluster of frog spawn floating in a pond."),
+                ("TADPOLE", "A small black tadpole with a long tail swimming."),
+            ],
+        )
+
+    def test_stage_briefs_ignore_a_stage_with_no_visual(self) -> None:
+        raw = "STAGE: Egg\nSTAGE: Tadpole\nVISUAL: A tadpole swimming in a pond."
+        self.assertEqual(_parse_stage_briefs(raw), [("TADPOLE", "A tadpole swimming in a pond.")])
 
 
 if __name__ == "__main__":
