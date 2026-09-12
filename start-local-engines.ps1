@@ -13,6 +13,7 @@ $env:OLLAMA_MODELS = $ollamaModels
 
 function Resolve-Ollama {
   $candidates = @(
+    'D:\CLI-Anything\Apps\Ollama\ollama.exe',
     (Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'),
     (Join-Path $env:ProgramFiles 'Ollama\ollama.exe')
   )
